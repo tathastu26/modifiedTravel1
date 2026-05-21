@@ -3,6 +3,34 @@ import { NextResponse } from 'next/server'
 const AIRLABS_BASE = 'https://airlabs.co/api/v9'
 const OPEN_WEATHER_BASE = 'https://api.openweathermap.org/data/2.5/weather'
 
+const AIRPORT_COORDS: Record<string, { lat: number; lon: number }> = {
+  DXB: { lat: 25.2532, lon: 55.3657 },
+  LAX: { lat: 33.9416, lon: -118.4085 },
+  JFK: { lat: 40.6413, lon: -73.7781 },
+  ORD: { lat: 41.9742, lon: -87.9073 },
+  LHR: { lat: 51.47, lon: -0.4543 },
+  CDG: { lat: 49.0097, lon: 2.5479 },
+  AMS: { lat: 52.3105, lon: 4.7683 },
+  FRA: { lat: 50.0379, lon: 8.5622 },
+  HND: { lat: 35.5494, lon: 139.7798 },
+  NRT: { lat: 35.7767, lon: 140.3188 },
+  SIN: { lat: 1.3644, lon: 103.9915 },
+  SFO: { lat: 37.6213, lon: -122.379 },
+  SEA: { lat: 47.4502, lon: -122.3088 },
+  BOS: { lat: 42.3656, lon: -71.0096 },
+  ATL: { lat: 33.6407, lon: -84.4277 },
+  DOH: { lat: 25.2736, lon: 51.6081 },
+  DEL: { lat: 28.5562, lon: 77.1 },
+  BOM: { lat: 19.0896, lon: 72.8656 },
+  BLR: { lat: 13.1986, lon: 77.7066 },
+  MAA: { lat: 12.9941, lon: 80.1709 },
+  HYD: { lat: 17.2403, lon: 78.4294 },
+  CCU: { lat: 22.6547, lon: 88.4467 },
+  AMD: { lat: 23.0772, lon: 72.6347 },
+  PNQ: { lat: 18.5822, lon: 73.9197 },
+  COK: { lat: 10.152, lon: 76.4019 },
+}
+
 const fetchJson = async (url: string) => {
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), 6000)
@@ -108,6 +136,53 @@ const congestionDelayMinutes = (nearbyAircraft: number | null) => {
   return 0
 }
 
+const airportCoords = (code?: string | null) => {
+  if (!code) return null
+  return AIRPORT_COORDS[code.trim().toUpperCase()] ?? null
+}
+
+const haversineKm = (lat1: number, lon1: number, lat2: number, lon2: number) => {
+  const R = 6371
+  const dLat = ((lat2 - lat1) * Math.PI) / 180
+  const dLon = ((lon2 - lon1) * Math.PI) / 180
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos((lat1 * Math.PI) / 180) *
+      Math.cos((lat2 * Math.PI) / 180) *
+      Math.sin(dLon / 2) ** 2
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a))
+}
+
+const calculateFallbackDelay = (params: {
+  currentLat: number
+  currentLon: number
+  destinationLat: number
+  destinationLon: number
+  speedKts: number | null
+  weatherDelay: number
+  congestionDelay: number
+}) => {
+  const speedKmh = Math.max((params.speedKts ?? 700) * 1.852, 300)
+  const remainingKm = haversineKm(
+    params.currentLat,
+    params.currentLon,
+    params.destinationLat,
+    params.destinationLon
+  )
+  const remainingMinutes = (remainingKm / speedKmh) * 60
+  const baseDelay = Math.max(0, Math.round(remainingMinutes * 0.08))
+  const totalDelay = Math.max(0, Math.round(baseDelay + params.weatherDelay + params.congestionDelay))
+
+  return {
+    totalDelay,
+    reasons: [
+      `Estimated ${Math.round(remainingKm)} km remaining`,
+      params.weatherDelay > 0 ? 'Weather affecting route' : null,
+      params.congestionDelay > 0 ? 'Airport congestion detected' : null,
+    ].filter(Boolean) as string[],
+  }
+}
+
 export async function GET(req: Request) {
   try {
     console.log('api/adsb GET start', { url: req.url })
@@ -144,6 +219,9 @@ export async function GET(req: Request) {
       return NextResponse.json({
         ...sample,
         weatherImpact: sampleWeatherImpact,
+        delaySource: 'demo',
+        delayStatus: 'Likely On Time',
+        delayReasons: ['Simulated test flight'],
         congestion: { count: 12, level: 'Low' },
         delayBreakdown: sampleDelayBreakdown,
         delayMinutes: sampleDelayBreakdown.totalMinutes,
@@ -185,11 +263,12 @@ export async function GET(req: Request) {
     const weatherDelay = weatherDelayMinutes(weatherMain)
 
     const airlabsData = pickAirlabsFlight(airlabsFlight)
-    const delayMinutes =
+    const apiDelayMinutes =
       normalizeDelayMinutes(airlabsData?.arrival_delay) ??
       normalizeDelayMinutes(airlabsData?.arr_delay) ??
       normalizeDelayMinutes(airlabsData?.departure_delay) ??
       normalizeDelayMinutes(airlabsData?.dep_delay) ??
+      normalizeDelayMinutes(airlabsData?.delayed) ??
       null
 
     const scheduledArrival = pickTimestamp([
@@ -251,7 +330,50 @@ export async function GET(req: Request) {
     }
 
     const congestionDelay = congestionDelayMinutes(congestionCount)
-    const totalDelay = Math.round(baseDelay + weatherDelay + congestionDelay)
+    const departureAirport = airportCoords(
+      typeof airlabsData?.dep_iata === 'string'
+        ? airlabsData.dep_iata
+        : typeof airlabsData?.dep_icao === 'string'
+          ? airlabsData.dep_icao
+          : null
+    )
+    const arrivalAirport = airportCoords(
+      typeof airlabsData?.arr_iata === 'string'
+        ? airlabsData.arr_iata
+        : typeof airlabsData?.arr_icao === 'string'
+          ? airlabsData.arr_icao
+          : null
+    )
+
+    const calculatedFallback =
+      lat != null && lon != null && arrivalAirport
+        ? calculateFallbackDelay({
+            currentLat: lat,
+            currentLon: lon,
+            destinationLat: arrivalAirport.lat,
+            destinationLon: arrivalAirport.lon,
+            speedKts: toNumber(aircraft?.gs),
+            weatherDelay,
+            congestionDelay,
+          })
+        : {
+            totalDelay: Math.round(baseDelay + weatherDelay + congestionDelay),
+            reasons: [
+              baseDelay > 0 ? `Estimated ${Math.round(baseDelay)} mins from schedule drift` : null,
+              weatherDelay > 0 ? 'Weather affecting route' : null,
+              congestionDelay > 0 ? 'Airport congestion detected' : null,
+            ].filter(Boolean) as string[],
+          }
+
+    const usingRealDelay = apiDelayMinutes != null
+    const totalDelay = usingRealDelay ? apiDelayMinutes : calculatedFallback.totalDelay
+    const reasons = usingRealDelay
+      ? [
+          `AirLabs reported ${apiDelayMinutes} mins delay`,
+          weatherDelay > 0 ? 'Weather affecting route' : null,
+          congestionDelay > 0 ? 'Airport congestion detected' : null,
+        ].filter(Boolean) as string[]
+      : calculatedFallback.reasons
 
     const congestionLevel =
       congestionCount == null
@@ -266,13 +388,15 @@ export async function GET(req: Request) {
     return NextResponse.json({
       ...(adsbData || {}),
       weatherImpact,
-      delayMinutes,
+      delaySource: usingRealDelay ? 'airlabs' : 'calculated-fallback',
+      delayStatus: totalDelay > 15 ? 'Delayed' : 'Likely On Time',
+      delayReasons: reasons,
       congestion: {
         count: congestionCount,
         level: congestionLevel,
       },
       delayBreakdown: {
-        baseMinutes: Math.round(baseDelay),
+        baseMinutes: usingRealDelay ? 0 : Math.round(baseDelay),
         weatherMinutes: weatherDelay,
         congestionMinutes: congestionDelay,
         totalMinutes: totalDelay,
